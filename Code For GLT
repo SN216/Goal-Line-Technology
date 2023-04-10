@@ -1,0 +1,240 @@
+# CLI Arguments
+# --file: Give a video file as input instead of camera
+# --flip: Flip the image if needed
+# --loop: Loop the video
+
+# Most effective thresholds for demo video
+# B 200,255
+# G 208,255
+# R 208,255
+
+import cv2 as opencv
+import numpy as np
+import argparse as ap
+from time import sleep
+import math
+
+COLOR_SPACE = "BGR"
+
+WINDOW_NAMES = {
+    "OUTPUT": "Final Output",
+    "PARAMETERS": "Parameters",
+    "BINARY": "Binary Filtered Image",
+    "DENOISED": "Denoised Image",
+    "CONTOURS": "Contours"
+}
+
+RESOLUTION_CAP = (1280, 780) # width, height in pixels
+
+DEFAULT_GOAL_LINE_DISTANCE = 20 # goal line distance in %
+GOAL_LINE_COLOR = (0, 0, 255) # in BGR format
+GOAL_LINE_THICKNESS = 3 # in pixels
+
+MIN_BALL_RADIUS = 30 # in pixels
+
+DEFAULT_WEBCAM_INDEX = 0
+
+CIRCLE_VERTICES_THRESHOLD = 6 # max number of vertices a non-circle polygon will have practically (see is_circle function below)
+CIRCLE_EPSILON_PERCENTAGE = 5 # see is_circle function below
+
+DEFAULT_THRESHOLDS = {
+    "B": [200, 255],
+    "G": [208, 255],
+    "R": [208, 255]
+}
+
+def setup_parameters_window(color_space):
+    opencv.namedWindow(WINDOW_NAMES["PARAMETERS"])
+
+    for channel in color_space:
+        opencv.createTrackbar(f"{channel}_MIN", WINDOW_NAMES["PARAMETERS"], DEFAULT_THRESHOLDS[channel][0], 255, lambda arg: None)
+        opencv.createTrackbar(f"{channel}_MAX", WINDOW_NAMES["PARAMETERS"], DEFAULT_THRESHOLDS[channel][1], 255, lambda arg: None)
+
+    opencv.createTrackbar("Goal Line Location (%)", WINDOW_NAMES["PARAMETERS"], DEFAULT_GOAL_LINE_DISTANCE, 100, lambda arg: None)
+
+def get_trackbar_values(color_space):
+    thresholds = []
+    i = 0
+
+    for channel in color_space:
+        thresholds.append([])
+
+        channel_min = opencv.getTrackbarPos(f"{channel}_MIN", WINDOW_NAMES["PARAMETERS"])
+        channel_max = opencv.getTrackbarPos(f"{channel}_MAX", WINDOW_NAMES["PARAMETERS"])
+
+        thresholds[i].append(channel_min)
+        thresholds[i].append(channel_max)
+
+        i += 1
+
+    GOAL_LINE_LOCATION = opencv.getTrackbarPos("Goal Line Location (%)", WINDOW_NAMES["PARAMETERS"])
+    return thresholds, GOAL_LINE_LOCATION
+
+def parse_args():
+    parser = ap.ArgumentParser()
+    parser.add_argument("--file", "-f", help="Path to a local file to read. (webcam will be used if no path is provided)", required=False)
+    parser.add_argument("--flip", help="Whether or not to flip the image.", required=False, default=False, action="store_true")
+    parser.add_argument("--loop", help="Whether or not to repeat the video.", required=False, default=False, action="store_true")
+
+    args = parser.parse_args()
+
+    return {
+        "FILE": args.file,
+        "FLIP": args.flip,
+        "LOOP": args.loop
+    }
+
+# reference: https://docs.opencv.org/3.4/dd/d49/tutorial_py_contour_features.html
+# and https://en.wikipedia.org/wiki/Ramer%E2%80%93Douglas%E2%80%93Peucker_algorithm
+# and https://www.pyimagesearch.com/2016/02/08/opencv-shape-detection/
+def is_circle(contour):
+    epsilon = opencv.arcLength(contour, True) * CIRCLE_EPSILON_PERCENTAGE / 100 # chosen empirically
+    approximate_shape = opencv.approxPolyDP(contour, epsilon, True) # approximate the contour to a simpler shape
+
+    number_of_vertices = len(approximate_shape)
+
+    # return number_of_vertices > CIRCLE_VERTICES_THRESHOLD and opencv.isContourConvex(contour) # contour must be convex and must have a lot of sides
+    # return opencv.isContourConvex(contour) # only convexity check
+    # return number_of_vertices > CIRCLE_VERTICES_THRESHOLD # only side check
+    return True # no checks
+
+def main():
+    args = parse_args()
+
+    # video source capture. source can be camera or a file
+    capture = opencv.VideoCapture(
+        DEFAULT_WEBCAM_INDEX if args["FILE"] == None # capture video from a webcam if no local file is provided
+        else args["FILE"] # load file if file provided
+    )
+
+    # set resolution
+    capture.set(opencv.CAP_PROP_FRAME_WIDTH, RESOLUTION_CAP[0])
+    capture.set(opencv.CAP_PROP_FRAME_HEIGHT, RESOLUTION_CAP[1])
+
+    setup_parameters_window(COLOR_SPACE)
+
+    frame_number = 1
+    video_over = False
+    original = None
+    got_frame = None
+    object_positions = []
+
+    def is_nearby_in_array(x, y):
+        is_nearby = False
+
+        for (x0, y0) in object_positions:
+            if math.sqrt((x - x0)**2 + (y - y0)**2) <= 50:
+                is_nearby = True
+                break
+
+        return is_nearby
+
+    while True: # run every frame
+        if not video_over:
+            got_frame, new_frame = capture.read()
+        else:
+            got_frame = True
+
+        if opencv.waitKey(1) is ord('q'):
+            break
+
+        if not got_frame:
+            if not video_over:
+                if not args["LOOP"]:
+                    print("No more frames found. The video is over.")
+                    video_over = True
+                else:
+                    capture.set(opencv.CAP_PROP_POS_FRAMES, 0)
+                    print("loop")
+                    object_positions = []
+                    frame_number = 1
+                    continue
+
+        elif got_frame and not video_over:
+            frame = new_frame
+
+        original = frame.copy()
+
+        if args["FLIP"]: original = opencv.flip(original, 1)
+
+        frame_number += 1
+
+        frame_width = len(original[0])
+        frame_height = len(original)
+
+        thresholds, GOAL_LINE_LOCATION = get_trackbar_values(COLOR_SPACE)
+
+        # converts to a binary image
+        # pixels inside the given threshold become completely white
+        # pixels outside the range become completely black
+        in_threshold = opencv.inRange(
+            original,
+            (thresholds[0][0], thresholds[1][0], thresholds[1][0]),
+            (thresholds[0][1], thresholds[0][1], thresholds[0][1])
+        )
+
+        # 5x5 array with 1s used as a kernel for morphology operations
+        kernel = np.ones((5, 5), np.uint8)
+
+        # Removal of noise using simple morphological operations
+        # more info here: https://docs.opencv.org/4.x/d9/d61/tutorial_py_morphological_ops.html
+        denoised = opencv.morphologyEx(in_threshold, opencv.MORPH_OPEN, kernel)
+        denoised = opencv.morphologyEx(denoised, opencv.MORPH_CLOSE, kernel)
+
+        # Find contours in the image. output is an array of points
+        # more info on https://docs.opencv.org/3.4/d4/d73/tutorial_py_contours_begin.html
+        contours, _ = opencv.findContours(denoised.copy(), opencv.RETR_EXTERNAL, opencv.CHAIN_APPROX_SIMPLE)
+
+        cnt_img = original.copy()
+        opencv.drawContours(cnt_img, contours, -1, (0, 0, 255), 2)
+
+        # Overlay a goal line on the image
+        goal_line_x = int(frame_width * GOAL_LINE_LOCATION / 100)
+        opencv.line(
+            original,
+            (goal_line_x, 0),
+            (goal_line_x, frame_height),
+            GOAL_LINE_COLOR,
+            GOAL_LINE_THICKNESS
+        )
+
+        if len(contours) > 0:
+            # check for every contour found
+            for contour in contours:
+
+                # only proceed if the contour is circular
+                if is_circle(contour):
+                    # position and radius of the smallest circle enclosing the contour
+                    ((x, y), radius) = opencv.minEnclosingCircle(contour)
+                    is_moving = False
+
+                    if not is_nearby_in_array(x, y):
+                        object_positions.append((x, y))
+                        is_moving = True
+                    else:
+                        is_moving = False
+
+                    # only proceed if the radius meets a minimum size
+                    if radius > MIN_BALL_RADIUS and is_moving and frame_number > 2:
+                        # draw the circle and centroid on the frame,
+                        # then update the list of tracked points
+                        opencv.circle(
+                            original,
+                            (int(x), int(y)),
+                            int(radius),
+                            (255, 0, 0),
+                            2
+                        )
+
+                        # goal is scored if the contour is inside the goal line
+                        if x < goal_line_x:
+                            opencv.putText(original, "GOAL!", (50, 50), opencv.FONT_HERSHEY_COMPLEX_SMALL, .7, (0, 255, 0))
+                            print(f"Goal found in frame number: {frame_number}")
+
+        opencv.imshow(WINDOW_NAMES["OUTPUT"], original)
+        opencv.imshow(WINDOW_NAMES["BINARY"], in_threshold)
+        opencv.imshow(WINDOW_NAMES["DENOISED"], denoised)
+        opencv.imshow(WINDOW_NAMES["CONTOURS"], cnt_img)
+
+if __name__ == '__main__':
+    main()
